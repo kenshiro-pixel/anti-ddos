@@ -11,6 +11,7 @@ GUI/CLI-инсталлятор для hardening Remnawave/Remnanode VPS с Nginx
 - план с явными портами SSH, Xray и Remnanode API;
 - собственная таблица `inet kenshi_shield` без `flush ruleset`;
 - явная input policy: совместимый `accept` или подтверждаемый режим `drop` для закрытия лишних портов;
+- выбор TCP/UDP портов и явный CDN allowlist по IPv4/IPv6 CIDR;
 - IPv4/IPv6 allowlist панели и администратора;
 - базовые SYN limits и обратимый outbound block TCP/25;
 - заготовка country policy для `RU,UA,GE,BY,AM,KZ`;
@@ -28,6 +29,8 @@ GUI/CLI-инсталлятор для hardening Remnawave/Remnanode VPS с Nginx
 GeoBlock не включается только по названию страны: для enforcement нужен проверенный GeoIP/ASN источник и атомарное обновление наборов. Per-user shaping требует адаптера к реальной идентичности Xray/Remnawave; в MVP глобальный лимит не применяется. XanMod kernel installation оставлена отдельным операторским шагом с reboot и rollback.
 
 Локальный firewall не заменяет provider DDoS scrubbing и не спасает от насыщения uplink. Панель, API, Xray transport и VPN handshake нужно проверять отдельно.
+
+Для CDN указывайте реальные диапазоны провайдера в `CDN_CIDRS`. Режим `drop` специально останавливается без этого списка, чтобы не отрезать Cloudflare или другой CDN. Список не подставляется автоматически из mutable URL.
 
 ## Запуск
 
@@ -61,7 +64,7 @@ sudo bash kenshi-shield.sh commit
 | `Оптимизация` | tier-aware sysctl, BBR/fq, conntrack, socket backlog, systemd limits и journald limits |
 | `Диагностика` | read-only отчёт по kernel/BBR/sysctl/conntrack/firewall/CrowdSec/Fail2Ban/listeners |
 
-465/587 остаются разрешёнными: базовая SMTP-политика затрагивает только outbound TCP/25. XanMod kernel, SYNPROXY, GeoIP enforcement, CrowdSec/Fail2Ban installation и per-user eBPF shaping остаются отдельными advanced-профилями: GUI показывает их явно и не применяет без отдельного подтверждения.
+465/587 остаются разрешёнными: базовая SMTP-политика затрагивает только outbound TCP/25. Оптимизация включает BBR/fq, TFO, MTU probing, keepalive, conntrack и file limits. Отключение IPv6 доступно только явным флагом `KENSHI_DISABLE_IPV6=1` после проверки CDN, Docker, ACME и Remnawave topology; по умолчанию IPv6 сохраняется. XanMod kernel, SYNPROXY, GeoIP enforcement, CrowdSec/Fail2Ban installation и per-user eBPF shaping остаются отдельными advanced-профилями: GUI показывает их явно и не применяет без отдельного подтверждения.
 
 ## Следующие модули
 

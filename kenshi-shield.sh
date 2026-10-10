@@ -15,6 +15,10 @@ OPT_FILE="${CONF_DIR}/optimize.env"
 SYSCTL_FILE="/etc/sysctl.d/99-kenshi-shield-optimize.conf"
 RPS_SCRIPT="/usr/local/sbin/kenshi-shield-rps"
 RPS_UNIT="/etc/systemd/system/kenshi-shield-rps.service"
+NGINX_TEMPLATE="${CONF_DIR}/nginx-performance.conf"
+CDN_MODE="${KENSHI_CDN_MODE:-off}"
+CDN_CIDRS="${KENSHI_CDN_CIDRS:-}"
+DISABLE_IPV6="${KENSHI_DISABLE_IPV6:-0}"
 SAFETY_DELAY="${KENSHI_SAFETY_DELAY:-300}"
 SELF_PATH="${KENSHI_SELF_PATH:-$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/$(basename -- "${BASH_SOURCE[0]}")}"
 TXN_DIR="${STATE_DIR}/transaction"
@@ -123,6 +127,8 @@ collect_plan() {
   SSH_PORT=${SSH_PORT:-22}
   TCP_PORTS=$(ask 'Public TCP ports (comma-separated)' '443')
   UDP_PORTS=$(ask 'Public UDP ports (comma-separated)' '')
+  CDN_MODE=$(ask 'CDN mode (off, cloudflare, custom)' "${CDN_MODE:-off}")
+  CDN_CIDRS=$(ask 'CDN IPv4/IPv6 CIDRs (comma-separated; required for drop)' "${CDN_CIDRS:-}")
   NODE_PORT=$(ask 'Remnanode API port (empty = no public allow)' '')
   PANEL_CIDRS=$(ask 'Panel/admin IPv4/IPv6 CIDRs (comma-separated)' '')
   INPUT_POLICY=$(ask 'Input policy (accept for compatibility, drop to close other ports)' 'accept')
@@ -136,11 +142,14 @@ collect_plan() {
 SSH_PORT=$SSH_PORT
 TCP_PORTS=$TCP_PORTS
 UDP_PORTS=$UDP_PORTS
+CDN_MODE=$CDN_MODE
+CDN_CIDRS=$CDN_CIDRS
 NODE_PORT=$NODE_PORT
 PANEL_CIDRS=$PANEL_CIDRS
 INPUT_POLICY=$INPUT_POLICY
 GEO_COUNTRIES=$GEO_COUNTRIES
 SHAPER_MODE=$SHAPER_MODE
+DISABLE_IPV6=$DISABLE_IPV6
 ENABLE_XANMOD=$ENABLE_XANMOD
 ENABLE_SYNPROXY=$ENABLE_SYNPROXY
 BLOCK_SMTP25=$BLOCK_SMTP25
@@ -167,11 +176,17 @@ load_plan() {
   valid_list "$UDP_PORTS" || die 'invalid UDP port list'
   [[ ${SSH_PORT:-} =~ ^[0-9]+$ ]] && (( SSH_PORT >= 1 && SSH_PORT <= 65535 )) || die 'invalid SSH port'
   valid_cidrs "${PANEL_CIDRS:-}" || die 'invalid panel/admin CIDR list'
+  valid_cidrs "${CDN_CIDRS:-}" || die 'invalid CDN CIDR list'
+  [[ ${CDN_MODE:-off} =~ ^(off|cloudflare|custom)$ ]] || die 'invalid CDN mode'
+  if [[ ${INPUT_POLICY:-accept} == drop && ${CDN_MODE:-off} != off && -z ${CDN_CIDRS:-} ]]; then
+    die 'CDN mode with input drop requires explicit CDN_CIDRS'
+  fi
   [[ ${INPUT_POLICY:-accept} =~ ^(accept|drop)$ ]] || die 'invalid input policy'
   valid_countries "${GEO_COUNTRIES:-}" || die 'invalid country allow-list (use CC,CC)'
   if [[ -n ${NODE_PORT:-} ]]; then [[ $NODE_PORT =~ ^[0-9]+$ ]] && (( NODE_PORT >= 1 && NODE_PORT <= 65535 )) || die 'invalid Remnanode port'; fi
   [[ ${SHAPER_MODE:-off} =~ ^(off|per-user|per-ip)$ ]] || die 'invalid shaping mode'
   [[ ${ENABLE_XANMOD:-0} =~ ^[01]$ && ${ENABLE_SYNPROXY:-0} =~ ^[01]$ && ${BLOCK_SMTP25:-0} =~ ^[01]$ ]] || die 'invalid feature flag'
+  [[ ${DISABLE_IPV6:-0} =~ ^[01]$ ]] || die 'invalid DISABLE_IPV6'
 }
 
 backup_file() {
@@ -190,7 +205,16 @@ compile_nft() {
   cmd nft || die 'nft is required; install it as a separate approved dependency step'
   local tcp="" udp=""; [[ -n ${TCP_PORTS:-} ]] && tcp="tcp dport { ${TCP_PORTS//,/ , } }"; [[ -n ${UDP_PORTS:-} ]] && udp="udp dport { ${UDP_PORTS//,/ , } }"
   local ssh="tcp dport ${SSH_PORT}" smtp_rule="" tcp_meters="" udp_meters="" p idx
+  local allow_v4="127.0.0.1" allow_v6="::1" cdn_v4="" cdn_v6="" c
   [[ ${BLOCK_SMTP25:-0} == 1 ]] && smtp_rule='tcp dport 25 counter reject with icmpx type admin-prohibited'
+  for c in ${PANEL_CIDRS//,/ }; do
+    [[ -z $c ]] && continue
+    if [[ $c == *:* ]]; then allow_v6+=", $c"; else allow_v4+=", $c"; fi
+  done
+  for c in ${CDN_CIDRS//,/ }; do
+    [[ -z $c ]] && continue
+    if [[ $c == *:* ]]; then cdn_v6+="${cdn_v6:+, }$c"; else cdn_v4+="${cdn_v4:+, }$c"; fi
+  done
   if [[ -n ${TCP_PORTS:-} ]]; then
     IFS=',' read -ra tcp_ports <<<"$TCP_PORTS"
     idx=0
@@ -210,8 +234,10 @@ compile_nft() {
   cat >"$NFT_FILE" <<EOF
 #!/usr/sbin/nft -f
 table inet kenshi_shield {
-  set allow_v4 { type ipv4_addr; flags interval; elements = { 127.0.0.1 } }
-  set allow_v6 { type ipv6_addr; flags interval; elements = { ::1 } }
+  set allow_v4 { type ipv4_addr; flags interval; elements = { ${allow_v4} } }
+  set allow_v6 { type ipv6_addr; flags interval; elements = { ${allow_v6} } }
+  set cdn_v4 { type ipv4_addr; flags interval; ${cdn_v4:+elements = { ${cdn_v4} }} }
+  set cdn_v6 { type ipv6_addr; flags interval; ${cdn_v6:+elements = { ${cdn_v6} }} }
   set scan_suspect_v4 { type ipv4_addr; flags dynamic,timeout; timeout 10m; size 65535; }
   set scan_confirmed_v4 { type ipv4_addr; flags dynamic,timeout; timeout 1h; size 65535; }
   set scan_suspect_v6 { type ipv6_addr; flags dynamic,timeout; timeout 10m; size 65535; }
@@ -244,9 +270,6 @@ ${tcp_meters}${udp_meters}
     $smtp_rule
   }
 EOF
-  if [[ -n ${PANEL_CIDRS:-} ]]; then
-    local c; IFS=',' read -ra cs <<<"$PANEL_CIDRS"; for c in "${cs[@]}"; do if [[ $c == *:* ]]; then sed -i "/elements = { ::1 }/s/::1/::1, $c/" "$NFT_FILE"; else sed -i "/elements = { 127.0.0.1 }/s/127.0.0.1/127.0.0.1, $c/" "$NFT_FILE"; fi; done
-  fi
   if [[ ${ENABLE_SYNPROXY:-0} == 1 && -n ${TCP_PORTS:-} ]]; then
     printf '  chain synproxy_guard { type filter hook input priority -10; policy accept; tcp dport { %s } tcp flags syn notrack synproxy mss 1460 wscale 7\n' "${TCP_PORTS//,/ , }" >>"$NFT_FILE"
     printf '  }\n' >>"$NFT_FILE"
@@ -307,6 +330,7 @@ ENABLE_BBR=1
 ENABLE_RPS=1
 ENABLE_FILE_LIMITS=1
 ENABLE_JOURNAL_LIMIT=1
+DISABLE_IPV6=${DISABLE_IPV6:-0}
 XANMOD_KERNEL=0
 EOF
   chmod 600 "$OPT_FILE"
@@ -320,16 +344,46 @@ apply_optimize() {
   cat >"$SYSCTL_FILE" <<EOF
 net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=bbr
+net.ipv4.tcp_fastopen=1
+net.ipv4.tcp_mtu_probing=1
+net.ipv4.tcp_slow_start_after_idle=0
 net.core.somaxconn=65535
 net.core.netdev_max_backlog=250000
 net.ipv4.tcp_max_syn_backlog=65535
 net.ipv4.tcp_syncookies=1
 net.netfilter.nf_conntrack_max=$CONNTRACK_MAX
 net.ipv4.tcp_fin_timeout=30
-net.ipv4.tcp_keepalive_time=600
-fs.file-max=1048576
+net.ipv4.tcp_tw_reuse=1
+net.ipv4.tcp_keepalive_time=300
+net.ipv4.tcp_keepalive_intvl=30
+net.ipv4.tcp_keepalive_probes=5
+net.ipv4.ip_local_port_range=1024 65535
+fs.file-max=2097152
+$(if [[ ${DISABLE_IPV6:-0} == 1 ]]; then printf '%s\n' 'net.ipv6.conf.all.disable_ipv6=1' 'net.ipv6.conf.default.disable_ipv6=1'; fi)
 EOF
   sysctl --system >/dev/null
+  backup_file "$NGINX_TEMPLATE"
+  cat >"$NGINX_TEMPLATE" <<'EOF'
+# Kenshi Shield reference profile. Include only after reviewing the active topology.
+worker_processes auto;
+worker_rlimit_nofile 1048576;
+events { worker_connections 65535; multi_accept on; }
+http {
+  sendfile on;
+  tcp_nopush on;
+  tcp_nodelay on;
+  server_tokens off;
+  ssl_protocols TLSv1.2 TLSv1.3;
+  keepalive_timeout 30s;
+  keepalive_requests 1000;
+  reset_timedout_connection on;
+  client_header_timeout 60s;
+  client_body_timeout 60s;
+  send_timeout 60s;
+  client_max_body_size 0;
+}
+EOF
+  chmod 600 "$NGINX_TEMPLATE"
   mkdir -p /etc/systemd/system.conf.d /etc/systemd/journald.conf.d
   backup_file /etc/systemd/system.conf.d/99-kenshi-shield-limits.conf
   cat >/etc/systemd/system.conf.d/99-kenshi-shield-limits.conf <<'EOF'
@@ -387,12 +441,13 @@ rollback() {
     if [[ -s $TXN_PREV_NFT ]]; then nft -f "$TXN_PREV_NFT" && restored=1 || true; fi
   fi
   (( restored == 1 )) || nft delete table inet kenshi_shield 2>/dev/null || true
-  rm -f "$NFT_FILE" "$SHAPER_FILE" "$GEO_FILE" "$CONF_DIR/plan.env"
+  rm -f "$NFT_FILE" "$SHAPER_FILE" "$GEO_FILE" "$CONF_DIR/plan.env" "$NGINX_TEMPLATE"
   rm -f /etc/sysctl.d/99-kenshi-shield.conf
   rm -f "$SYSCTL_FILE" "$OPT_FILE" /etc/systemd/system.conf.d/99-kenshi-shield-limits.conf /etc/systemd/journald.conf.d/99-kenshi-shield.conf
   restore_latest "$SYSCTL_FILE" || true
   restore_latest /etc/systemd/system.conf.d/99-kenshi-shield-limits.conf || true
   restore_latest /etc/systemd/journald.conf.d/99-kenshi-shield.conf || true
+  restore_latest "$NGINX_TEMPLATE" || true
   systemctl disable --now kenshi-shield-rps.service >/dev/null 2>&1 || true
   systemctl stop "$SAFETY_UNIT" 2>/dev/null || true
   rm -rf "$TXN_DIR"
