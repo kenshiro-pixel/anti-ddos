@@ -10,6 +10,7 @@ LOG_FILE="${STATE_DIR}/operations.log"
 NFT_FILE="${CONF_DIR}/firewall.nft"
 GEO_FILE="${CONF_DIR}/geoblock-countries.txt"
 SHAPER_FILE="${CONF_DIR}/shaping.conf"
+DRY_RUN="${KENSHI_DRY_RUN:-0}"
 OPT_FILE="${CONF_DIR}/optimize.env"
 SYSCTL_FILE="/etc/sysctl.d/99-kenshi-shield-optimize.conf"
 RPS_SCRIPT="/usr/local/sbin/kenshi-shield-rps"
@@ -69,11 +70,13 @@ ask() { local prompt=$1 default=$2; if [[ $UI == plain ]]; then read -r -p "$pro
 yesno() { if [[ $UI == plain ]]; then read -r -p "$1 [y/N]: " v; [[ $v == y || $v == Y ]]; else "$UI" --yesno "$1" 10 78; fi; }
 
 collect_plan() {
-  SSH_PORT=$(ask 'SSH port' "$(ss -H -lnt 2>/dev/null | awk '$4 ~ /:22$/ {print 22; exit}' || printf 22)")
+  SSH_PORT=$(ask 'SSH port' "${SSH_PORT:-$(ss -H -lnt 2>/dev/null | awk '$4 ~ /:22$/ {print 22; exit}' || true)}")
+  SSH_PORT=${SSH_PORT:-22}
   TCP_PORTS=$(ask 'Public TCP ports (comma-separated)' '443')
   UDP_PORTS=$(ask 'Public UDP ports (comma-separated)' '')
   NODE_PORT=$(ask 'Remnanode API port (empty = no public allow)' '')
   PANEL_CIDRS=$(ask 'Panel/admin IPv4/IPv6 CIDRs (comma-separated)' '')
+  INPUT_POLICY=$(ask 'Input policy (accept for compatibility, drop to close other ports)' 'accept')
   GEO_COUNTRIES=$(ask 'Allowed countries for geo policy' 'RU,UA,GE,BY,AM,KZ')
   SHAPER_MODE=$(ask 'Traffic shaping (off, per-user, per-ip)' 'off')
   ENABLE_XANMOD=0; ENABLE_SYNPROXY=0; BLOCK_SMTP25=1
@@ -86,6 +89,7 @@ TCP_PORTS=$TCP_PORTS
 UDP_PORTS=$UDP_PORTS
 NODE_PORT=$NODE_PORT
 PANEL_CIDRS=$PANEL_CIDRS
+INPUT_POLICY=$INPUT_POLICY
 GEO_COUNTRIES=$GEO_COUNTRIES
 SHAPER_MODE=$SHAPER_MODE
 ENABLE_XANMOD=$ENABLE_XANMOD
@@ -95,21 +99,51 @@ EOF
   chmod 600 "$PLAN_FILE"
 }
 
-valid_list() { [[ -z "$1" || "$1" =~ ^[0-9]+(,[0-9]+)*$ ]]; }
-load_plan() { [[ -r $PLAN_FILE ]] || collect_plan; . "$PLAN_FILE"; valid_list "$TCP_PORTS" || die 'invalid TCP port list'; valid_list "$UDP_PORTS" || die 'invalid UDP port list'; }
+valid_list() {
+  [[ -z "$1" || "$1" =~ ^[0-9]+(,[0-9]+)*$ ]] || return 1
+  local p; IFS=',' read -ra ports <<<"$1"
+  for p in "${ports[@]}"; do (( p >= 1 && p <= 65535 )) || return 1; done
+}
+valid_cidrs() {
+  local c; [[ -z ${1:-} ]] && return 0; IFS=',' read -ra cidrs <<<"$1"
+  for c in "${cidrs[@]}"; do
+    [[ $c =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}(/([0-9]|[1-2][0-9]|3[0-2]))?$ || $c =~ ^[0-9A-Fa-f:]+(/[0-9]{1,3})?$ ]] || return 1
+  done
+}
+valid_countries() { [[ ${1:-} =~ ^[A-Z]{2}(,[A-Z]{2})*$ ]]; }
+load_plan() {
+  [[ -r $PLAN_FILE ]] || collect_plan
+  . "$PLAN_FILE"
+  valid_list "$TCP_PORTS" || die 'invalid TCP port list'
+  valid_list "$UDP_PORTS" || die 'invalid UDP port list'
+  [[ ${SSH_PORT:-} =~ ^[0-9]+$ ]] && (( SSH_PORT >= 1 && SSH_PORT <= 65535 )) || die 'invalid SSH port'
+  valid_cidrs "${PANEL_CIDRS:-}" || die 'invalid panel/admin CIDR list'
+  [[ ${INPUT_POLICY:-accept} =~ ^(accept|drop)$ ]] || die 'invalid input policy'
+  valid_countries "${GEO_COUNTRIES:-}" || die 'invalid country allow-list (use CC,CC)'
+  if [[ -n ${NODE_PORT:-} ]]; then [[ $NODE_PORT =~ ^[0-9]+$ ]] && (( NODE_PORT >= 1 && NODE_PORT <= 65535 )) || die 'invalid Remnanode port'; fi
+  [[ ${SHAPER_MODE:-off} =~ ^(off|per-user|per-ip)$ ]] || die 'invalid shaping mode'
+  [[ ${ENABLE_XANMOD:-0} =~ ^[01]$ && ${ENABLE_SYNPROXY:-0} =~ ^[01]$ && ${BLOCK_SMTP25:-0} =~ ^[01]$ ]] || die 'invalid feature flag'
+}
 
 backup_file() { local f=$1; [[ -e $f ]] && cp -a -- "$f" "$BACKUP_DIR/$(basename "$f").$(date +%s)" || true; }
+restore_latest() {
+  local target=$1 base; base=$(basename "$target")
+  local latest; latest=$(ls -1t "$BACKUP_DIR"/"$base".* 2>/dev/null | head -1 || true)
+  [[ -n $latest ]] && cp -a -- "$latest" "$target"
+}
 
 compile_nft() {
+  cmd nft || die 'nft is required; install it as a separate approved dependency step'
   local tcp="" udp=""; [[ -n ${TCP_PORTS:-} ]] && tcp="tcp dport { ${TCP_PORTS//,/ , } }"; [[ -n ${UDP_PORTS:-} ]] && udp="udp dport { ${UDP_PORTS//,/ , } }"
-  local ssh="tcp dport ${SSH_PORT}"
+  local ssh="tcp dport ${SSH_PORT}" smtp_rule=""
+  [[ ${BLOCK_SMTP25:-0} == 1 ]] && smtp_rule='tcp dport 25 counter reject with icmpx type admin-prohibited'
   cat >"$NFT_FILE" <<EOF
 #!/usr/sbin/nft -f
 table inet kenshi_shield {
   set allow_v4 { type ipv4_addr; flags interval; elements = { 127.0.0.1 } }
   set allow_v6 { type ipv6_addr; flags interval; elements = { ::1 } }
   chain input {
-    type filter hook input priority -5; policy accept;
+    type filter hook input priority -5; policy ${INPUT_POLICY:-accept};
     ct state invalid counter drop
     iif lo accept
     ip protocol icmp limit rate 10/second accept
@@ -125,7 +159,7 @@ table inet kenshi_shield {
   }
   chain output {
     type filter hook output priority -5; policy accept;
-    ${BLOCK_SMTP25:+tcp dport 25 counter reject with icmpx type admin-prohibited}
+    $smtp_rule
   }
 EOF
   if [[ -n ${PANEL_CIDRS:-} ]]; then
@@ -141,6 +175,7 @@ EOF
 
 apply_firewall() {
   need_root; init_dirs; load_plan; backup_file "$NFT_FILE"; compile_nft
+  [[ $DRY_RUN == 1 ]] && { info "DRY_RUN=1: nft rules validated but not applied"; return; }
   nft -f "$NFT_FILE"
   cp -a "$PLAN_FILE" "$CONF_DIR/plan.env"
   printf '%s firewall applied\n' "$(date -Is)" >>"$LOG_FILE"
@@ -148,6 +183,7 @@ apply_firewall() {
 
 apply_geoblock() {
   need_root; init_dirs; load_plan
+  [[ $DRY_RUN == 1 ]] && { info "DRY_RUN=1: GeoBlock policy not written"; return; }
   info 'GeoBlock is staged as an explicit policy; country databases are not downloaded from mutable URLs.'
   printf '%s\n' "$GEO_COUNTRIES" | tr ',' '\n' >"$GEO_FILE"; chmod 600 "$GEO_FILE"
   info "Allowed countries saved to $GEO_FILE. An ASN/IP database provider must be configured before enforcement."
@@ -155,6 +191,7 @@ apply_geoblock() {
 
 apply_shaping() {
   need_root; init_dirs; load_plan
+  [[ $DRY_RUN == 1 ]] && { info "DRY_RUN=1: shaping policy not written"; return; }
   printf 'mode=%s\n' "$SHAPER_MODE" >"$SHAPER_FILE"; chmod 600 "$SHAPER_FILE"
   if [[ $SHAPER_MODE != off ]]; then info 'Per-user shaping requires a verified Xray/eBPF identity adapter; no global bandwidth cap is applied by this MVP.'; fi
 }
@@ -194,6 +231,7 @@ EOF
 
 apply_optimize() {
   need_root; init_dirs; [[ -r $OPT_FILE ]] || optimize_plan; . "$OPT_FILE"
+  [[ $DRY_RUN == 1 ]] && { info "DRY_RUN=1: optimization files and services not changed"; return; }
   backup_file "$SYSCTL_FILE"
   cat >"$SYSCTL_FILE" <<EOF
 net.core.default_qdisc=fq
@@ -263,10 +301,24 @@ rollback() {
   rm -f "$NFT_FILE" "$SHAPER_FILE" "$GEO_FILE" "$CONF_DIR/plan.env"
   rm -f /etc/sysctl.d/99-kenshi-shield.conf
   rm -f "$SYSCTL_FILE" "$OPT_FILE" /etc/systemd/system.conf.d/99-kenshi-shield-limits.conf /etc/systemd/journald.conf.d/99-kenshi-shield.conf
+  restore_latest "$SYSCTL_FILE" || true
+  restore_latest /etc/systemd/system.conf.d/99-kenshi-shield-limits.conf || true
+  restore_latest /etc/systemd/journald.conf.d/99-kenshi-shield.conf || true
   systemctl disable --now kenshi-shield-rps.service >/dev/null 2>&1 || true
   rm -f "$RPS_SCRIPT" "$RPS_UNIT"
   sysctl --system >/dev/null 2>&1 || true
   info 'Kenshi Shield resources rolled back; third-party firewall tables and kernels were not removed.'
+}
+
+status() {
+  need_root; init_dirs
+  printf 'Kenshi Shield %s status\n' "$VERSION"
+  if nft list table inet kenshi_shield >/dev/null 2>&1; then printf 'firewall: active\n'; else printf 'firewall: inactive\n'; fi
+  [[ -r $OPT_FILE ]] && printf 'optimization: planned (%s)\n' "$OPT_FILE" || printf 'optimization: not planned\n'
+  [[ ${INPUT_POLICY:-} == drop ]] && printf 'input policy: drop\n' || printf 'input policy: accept/unknown\n'
+  [[ -r $GEO_FILE ]] && printf 'geoblock policy: staged\n' || printf 'geoblock policy: not configured\n'
+  [[ -r $SHAPER_FILE ]] && printf 'shaping: %s\n' "$(tr -d '\n' <"$SHAPER_FILE")" || printf 'shaping: not configured\n'
+  systemctl is-enabled --quiet kenshi-shield-rps.service 2>/dev/null && printf 'rps/rfs/xps: enabled\n' || printf 'rps/rfs/xps: disabled\n'
 }
 
 menu() {
@@ -277,4 +329,4 @@ menu() {
   done
 }
 
-case ${1:-menu} in audit|diagnose) diagnose ;; plan) init_dirs; collect_plan; compile_nft ;; protect|apply-firewall) apply_firewall ;; optimize) optimize_plan; apply_optimize ;; apply) apply_firewall; apply_geoblock; apply_shaping; apply_xanmod ;; rollback) rollback ;; menu) menu ;; *) die "usage: $0 [menu|diagnose|protect|optimize|plan|apply|rollback]" ;; esac
+case ${1:-menu} in audit|diagnose) diagnose ;; status) status ;; plan) init_dirs; collect_plan; compile_nft ;; protect|apply-firewall) apply_firewall ;; optimize) optimize_plan; apply_optimize ;; apply) apply_firewall; apply_geoblock; apply_shaping; apply_xanmod ;; rollback) rollback ;; menu) menu ;; *) die "usage: $0 [menu|status|diagnose|protect|optimize|plan|apply|rollback]" ;; esac

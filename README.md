@@ -10,6 +10,7 @@ GUI/CLI-инсталлятор для hardening Remnawave/Remnanode VPS с Nginx
 - read-only аудит ОС, ядра, виртуализации, listeners, firewall и сервисов;
 - план с явными портами SSH, Xray и Remnanode API;
 - собственная таблица `inet kenshi_shield` без `flush ruleset`;
+- явная input policy: совместимый `accept` или подтверждаемый режим `drop` для закрытия лишних портов;
 - IPv4/IPv6 allowlist панели и администратора;
 - базовые SYN limits и обратимый outbound block TCP/25;
 - заготовка country policy для `RU,UA,GE,BY,AM,KZ`;
@@ -36,6 +37,8 @@ sudo bash kenshi-shield.sh rollback
 ```
 
 Перед `apply` проверьте сгенерированный `/etc/kenshi-shield/firewall.nft`. SSH-порт и адреса панели должны быть указаны явно. Не применяйте правила на production без консольного доступа или проверенного watchdog/recovery пути.
+
+Для проверки без применения используйте `KENSHI_DRY_RUN=1`. В режиме `drop` нужно заранее перечислить SSH, публичные Xray-порты, UDP-порты и управляющие CIDR; текущая SSH-сессия сама по себе не считается достаточной проверкой.
 
 ## Модули GUI
 
