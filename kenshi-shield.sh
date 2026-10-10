@@ -15,14 +15,63 @@ OPT_FILE="${CONF_DIR}/optimize.env"
 SYSCTL_FILE="/etc/sysctl.d/99-kenshi-shield-optimize.conf"
 RPS_SCRIPT="/usr/local/sbin/kenshi-shield-rps"
 RPS_UNIT="/etc/systemd/system/kenshi-shield-rps.service"
+SAFETY_DELAY="${KENSHI_SAFETY_DELAY:-300}"
+SELF_PATH="${KENSHI_SELF_PATH:-$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/$(basename -- "${BASH_SOURCE[0]}")}"
+TXN_DIR="${STATE_DIR}/transaction"
+TXN_PREV_NFT="${TXN_DIR}/previous.nft"
+TXN_PREV_NFT_MISSING="${TXN_DIR}/previous.nft.missing"
+TXN_STATE="${TXN_DIR}/state"
+SAFETY_UNIT="kenshi-shield-safety.service"
 
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 info() { printf '[kenshi] %s\n' "$*"; }
-need_root() { [[ ${EUID} -eq 0 ]] || die 'запустите от root или через sudo'; }
+need_root() { [[ ${EUID} -eq 0 || ${KENSHI_TEST_MODE:-0} == 1 ]] || die 'запустите от root или через sudo'; }
 cmd() { command -v "$1" >/dev/null 2>&1; }
 run() { printf '+ %q' "$@" >>"$LOG_FILE"; printf '\n' >>"$LOG_FILE"; "$@"; }
 
 init_dirs() { mkdir -p "$STATE_DIR" "$BACKUP_DIR" "$CONF_DIR"; chmod 700 "$STATE_DIR" "$CONF_DIR"; touch "$LOG_FILE"; chmod 600 "$LOG_FILE"; }
+
+capture_previous_nft() {
+  mkdir -p "$TXN_DIR"; chmod 700 "$TXN_DIR"
+  rm -f "$TXN_PREV_NFT" "$TXN_PREV_NFT_MISSING"
+  if nft list table inet kenshi_shield >"$TXN_PREV_NFT" 2>/dev/null; then
+    chmod 600 "$TXN_PREV_NFT"
+    printf 'present\n' >"$TXN_STATE"
+  else
+    : >"$TXN_PREV_NFT_MISSING"
+    printf 'missing\n' >"$TXN_STATE"
+  fi
+  chmod 600 "$TXN_STATE"
+}
+
+watchdog_recover() {
+  need_root; init_dirs
+  [[ -r $TXN_STATE ]] || { info 'No pending transaction'; return 0; }
+  local state; state=$(<"$TXN_STATE")
+  [[ $state == pending ]] || { info "Transaction state is $state; nothing to recover"; return 0; }
+  nft delete table inet kenshi_shield 2>/dev/null || true
+  if [[ -s $TXN_PREV_NFT ]]; then nft -f "$TXN_PREV_NFT"; fi
+  printf 'recovered\n' >"$TXN_STATE"
+  info 'Safety watchdog restored the previous Kenshi Shield table.'
+}
+
+arm_watchdog() {
+  (( SAFETY_DELAY > 0 )) || return 0
+  printf 'pending\n' >"$TXN_STATE"; chmod 600 "$TXN_STATE"
+  systemd-run --quiet --unit="$SAFETY_UNIT" --on-active="${SAFETY_DELAY}s" \
+    /usr/bin/env bash "$SELF_PATH" watchdog-recover >/dev/null 2>&1 || die 'failed to arm safety watchdog'
+  info "Safety watchdog armed for ${SAFETY_DELAY}s; run '$SELF_PATH commit' after independent checks."
+}
+
+commit_transaction() {
+  need_root; init_dirs
+  [[ -r $TXN_STATE ]] || { info 'No pending transaction'; return 0; }
+  local state; state=$(<"$TXN_STATE")
+  [[ $state == pending ]] || { info "Transaction state is $state"; return 0; }
+  systemctl stop "$SAFETY_UNIT" 2>/dev/null || true
+  printf 'committed\n' >"$TXN_STATE"; chmod 600 "$TXN_STATE"
+  info 'Firewall transaction committed; watchdog stopped.'
+}
 
 audit() {
   need_root; init_dirs
@@ -125,37 +174,70 @@ load_plan() {
   [[ ${ENABLE_XANMOD:-0} =~ ^[01]$ && ${ENABLE_SYNPROXY:-0} =~ ^[01]$ && ${BLOCK_SMTP25:-0} =~ ^[01]$ ]] || die 'invalid feature flag'
 }
 
-backup_file() { local f=$1; [[ -e $f ]] && cp -a -- "$f" "$BACKUP_DIR/$(basename "$f").$(date +%s)" || true; }
+backup_file() {
+  local f=$1 base stamp
+  base=$(basename "$f"); stamp=$(date +%s)
+  if [[ -e $f ]]; then cp -a -- "$f" "$BACKUP_DIR/$base.$stamp"; else : >"$BACKUP_DIR/$base.missing.$stamp"; fi
+}
 restore_latest() {
   local target=$1 base; base=$(basename "$target")
   local latest; latest=$(ls -1t "$BACKUP_DIR"/"$base".* 2>/dev/null | head -1 || true)
-  [[ -n $latest ]] && cp -a -- "$latest" "$target"
+  [[ -z $latest ]] && return 0
+  if [[ $latest == *.missing.* ]]; then rm -f -- "$target"; else mkdir -p "$(dirname "$target")"; cp -a -- "$latest" "$target"; fi
 }
 
 compile_nft() {
   cmd nft || die 'nft is required; install it as a separate approved dependency step'
   local tcp="" udp=""; [[ -n ${TCP_PORTS:-} ]] && tcp="tcp dport { ${TCP_PORTS//,/ , } }"; [[ -n ${UDP_PORTS:-} ]] && udp="udp dport { ${UDP_PORTS//,/ , } }"
-  local ssh="tcp dport ${SSH_PORT}" smtp_rule=""
+  local ssh="tcp dport ${SSH_PORT}" smtp_rule="" tcp_meters="" udp_meters="" p idx
   [[ ${BLOCK_SMTP25:-0} == 1 ]] && smtp_rule='tcp dport 25 counter reject with icmpx type admin-prohibited'
+  if [[ -n ${TCP_PORTS:-} ]]; then
+    IFS=',' read -ra tcp_ports <<<"$TCP_PORTS"
+    idx=0
+    for p in "${tcp_ports[@]}"; do
+      tcp_meters+=$'    meter tcp_syn_'"${idx}"$' { ip saddr limit rate 60/second burst 120 packets } tcp dport '"${p}"$' tcp flags syn counter accept\n'
+      idx=$((idx + 1))
+    done
+  fi
+  if [[ -n ${UDP_PORTS:-} ]]; then
+    IFS=',' read -ra udp_ports <<<"$UDP_PORTS"
+    idx=0
+    for p in "${udp_ports[@]}"; do
+      udp_meters+=$'    meter udp_rate_'"${idx}"$' { ip saddr limit rate 120/second burst 240 packets } udp dport '"${p}"$' counter accept\n'
+      idx=$((idx + 1))
+    done
+  fi
   cat >"$NFT_FILE" <<EOF
 #!/usr/sbin/nft -f
 table inet kenshi_shield {
   set allow_v4 { type ipv4_addr; flags interval; elements = { 127.0.0.1 } }
   set allow_v6 { type ipv6_addr; flags interval; elements = { ::1 } }
+  set scan_suspect_v4 { type ipv4_addr; flags dynamic,timeout; timeout 10m; size 65535; }
+  set scan_confirmed_v4 { type ipv4_addr; flags dynamic,timeout; timeout 1h; size 65535; }
+  set scan_suspect_v6 { type ipv6_addr; flags dynamic,timeout; timeout 10m; size 65535; }
+  set scan_confirmed_v6 { type ipv6_addr; flags dynamic,timeout; timeout 1h; size 65535; }
   chain input {
     type filter hook input priority -5; policy ${INPUT_POLICY:-accept};
     ct state invalid counter drop
     iif lo accept
-    ip protocol icmp limit rate 10/second accept
-    ip6 nexthdr icmpv6 limit rate 10/second accept
+    tcp flags & (fin|syn|rst|ack) == (fin|syn) counter drop
+    tcp flags & (fin|syn|rst|ack) == (fin|rst) counter drop
+    tcp flags & (fin|syn|rst|ack) == (syn|rst) counter drop
+    tcp flags & (fin|syn|rst|ack) == fin counter drop
+    ip protocol icmp limit rate 10/second burst 20 packets accept
+    ip6 nexthdr icmpv6 limit rate 10/second burst 20 packets accept
     ct state established,related accept
     ip saddr @allow_v4 accept
     ip6 saddr @allow_v6 accept
+    ip saddr @scan_confirmed_v4 counter drop
+    ip6 saddr @scan_confirmed_v6 counter drop
     $ssh accept
-    ${tcp:+$tcp accept}
-    ${udp:+$udp accept}
     ${NODE_PORT:+tcp dport $NODE_PORT ip saddr @allow_v4 accept}
-    tcp flags & (fin|syn|rst|ack) == syn limit rate 100/second burst 200 packets counter drop
+${tcp_meters}${udp_meters}
+    tcp flags syn add @scan_suspect_v4 { ip saddr timeout 10m } limit rate over 100/second burst 200 packets counter drop
+    ip6 nexthdr tcp tcp flags syn add @scan_suspect_v6 { ip6 saddr timeout 10m } limit rate over 100/second burst 200 packets counter drop
+    ip saddr @scan_suspect_v4 tcp flags syn add @scan_confirmed_v4 { ip saddr timeout 1h } counter drop
+    ip6 saddr @scan_suspect_v6 ip6 nexthdr tcp tcp flags syn add @scan_confirmed_v6 { ip6 saddr timeout 1h } counter drop
   }
   chain output {
     type filter hook output priority -5; policy accept;
@@ -176,7 +258,9 @@ EOF
 apply_firewall() {
   need_root; init_dirs; load_plan; backup_file "$NFT_FILE"; compile_nft
   [[ $DRY_RUN == 1 ]] && { info "DRY_RUN=1: nft rules validated but not applied"; return; }
+  capture_previous_nft
   nft -f "$NFT_FILE"
+  arm_watchdog
   cp -a "$PLAN_FILE" "$CONF_DIR/plan.env"
   printf '%s firewall applied\n' "$(date -Is)" >>"$LOG_FILE"
 }
@@ -297,7 +381,12 @@ EOF
 
 rollback() {
   need_root; init_dirs
-  nft delete table inet kenshi_shield 2>/dev/null || true
+  local restored=0
+  if [[ -r $TXN_STATE ]] && [[ $(<"$TXN_STATE") == pending ]]; then
+    nft delete table inet kenshi_shield 2>/dev/null || true
+    if [[ -s $TXN_PREV_NFT ]]; then nft -f "$TXN_PREV_NFT" && restored=1 || true; fi
+  fi
+  (( restored == 1 )) || nft delete table inet kenshi_shield 2>/dev/null || true
   rm -f "$NFT_FILE" "$SHAPER_FILE" "$GEO_FILE" "$CONF_DIR/plan.env"
   rm -f /etc/sysctl.d/99-kenshi-shield.conf
   rm -f "$SYSCTL_FILE" "$OPT_FILE" /etc/systemd/system.conf.d/99-kenshi-shield-limits.conf /etc/systemd/journald.conf.d/99-kenshi-shield.conf
@@ -305,6 +394,8 @@ rollback() {
   restore_latest /etc/systemd/system.conf.d/99-kenshi-shield-limits.conf || true
   restore_latest /etc/systemd/journald.conf.d/99-kenshi-shield.conf || true
   systemctl disable --now kenshi-shield-rps.service >/dev/null 2>&1 || true
+  systemctl stop "$SAFETY_UNIT" 2>/dev/null || true
+  rm -rf "$TXN_DIR"
   rm -f "$RPS_SCRIPT" "$RPS_UNIT"
   sysctl --system >/dev/null 2>&1 || true
   info 'Kenshi Shield resources rolled back; third-party firewall tables and kernels were not removed.'
@@ -329,4 +420,4 @@ menu() {
   done
 }
 
-case ${1:-menu} in audit|diagnose) diagnose ;; status) status ;; plan) init_dirs; collect_plan; compile_nft ;; protect|apply-firewall) apply_firewall ;; optimize) optimize_plan; apply_optimize ;; apply) apply_firewall; apply_geoblock; apply_shaping; apply_xanmod ;; rollback) rollback ;; menu) menu ;; *) die "usage: $0 [menu|status|diagnose|protect|optimize|plan|apply|rollback]" ;; esac
+case ${1:-menu} in audit|diagnose) diagnose ;; status) status ;; plan) init_dirs; if [[ ! -r $PLAN_FILE ]]; then choose_ui; collect_plan; fi; load_plan; compile_nft ;; protect|apply-firewall) apply_firewall ;; optimize) optimize_plan; apply_optimize ;; apply) apply_firewall; apply_geoblock; apply_shaping; apply_xanmod ;; commit) commit_transaction ;; watchdog-recover) watchdog_recover ;; rollback) rollback ;; menu) menu ;; *) die "usage: $0 [menu|status|diagnose|protect|optimize|plan|apply|commit|rollback]" ;; esac
