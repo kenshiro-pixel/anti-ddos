@@ -15,6 +15,8 @@ GUI/CLI-инсталлятор для hardening Remnawave/Remnanode VPS с Nginx
 - заготовка country policy для `RU,UA,GE,BY,AM,KZ`;
 - профиль shaping без опасного глобального ограничения трафика;
 - BBR/sysctl и отдельный advanced SYNPROXY режим;
+- отдельные GUI-пункты `Защита`, `Оптимизация`, `Диагностика`;
+- tier-aware оптимизация по RAM/CPU: BBR/fq, conntrack, backlog, file limits и journald;
 - backup собственного ruleset и rollback.
 
 ## Важно
@@ -34,6 +36,16 @@ sudo bash kenshi-shield.sh rollback
 ```
 
 Перед `apply` проверьте сгенерированный `/etc/kenshi-shield/firewall.nft`. SSH-порт и адреса панели должны быть указаны явно. Не применяйте правила на production без консольного доступа или проверенного watchdog/recovery пути.
+
+## Модули GUI
+
+| Модуль | Что делает |
+|---|---|
+| `Защита от DDoS` | nftables в собственной таблице, per-IP SYN controls, allowlist, TCP/25 policy и подготовка к CrowdSec/SYNPROXY |
+| `Оптимизация` | tier-aware sysctl, BBR/fq, conntrack, socket backlog, systemd limits и journald limits |
+| `Диагностика` | read-only отчёт по kernel/BBR/sysctl/conntrack/firewall/CrowdSec/Fail2Ban/listeners |
+
+XanMod kernel, SYNPROXY, GeoIP enforcement и per-user eBPF shaping остаются отдельными advanced-профилями: GUI показывает их явно и не применяет без отдельного подтверждения.
 
 ## Следующие модули
 

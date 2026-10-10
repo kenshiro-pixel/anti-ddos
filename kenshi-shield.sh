@@ -10,6 +10,10 @@ LOG_FILE="${STATE_DIR}/operations.log"
 NFT_FILE="${CONF_DIR}/firewall.nft"
 GEO_FILE="${CONF_DIR}/geoblock-countries.txt"
 SHAPER_FILE="${CONF_DIR}/shaping.conf"
+OPT_FILE="${CONF_DIR}/optimize.env"
+SYSCTL_FILE="/etc/sysctl.d/99-kenshi-shield-optimize.conf"
+RPS_SCRIPT="/usr/local/sbin/kenshi-shield-rps"
+RPS_UNIT="/etc/systemd/system/kenshi-shield-rps.service"
 
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 info() { printf '[kenshi] %s\n' "$*"; }
@@ -35,6 +39,27 @@ audit() {
   done
   printf '\nNetwork:\n'; ip -brief address 2>/dev/null || true
   printf '\nOutbound SMTP snapshot:\n'; ss -H -tnp 2>/dev/null | awk '$4 ~ /:25$/ || $5 ~ /:25$/ {print}' | head -20 || true
+}
+
+diagnose() {
+  need_root; init_dirs
+  printf 'Kenshi Shield %s - диагностика\n\n' "$VERSION"
+  local ram_mb cpus virt bbr qdisc conntrack nofile
+  ram_mb=$(awk '/MemTotal:/ {printf "%d", $2/1024}' /proc/meminfo 2>/dev/null || printf 0)
+  cpus=$(nproc 2>/dev/null || printf 1)
+  virt=$(systemd-detect-virt 2>/dev/null || printf none)
+  bbr=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || printf unknown)
+  qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || printf unknown)
+  conntrack=$(sysctl -n net.netfilter.nf_conntrack_max 2>/dev/null || printf unavailable)
+  nofile=$(ulimit -n 2>/dev/null || printf unavailable)
+  printf '[%s] kernel: %s\n' "$([[ $bbr == bbr ]] && printf OK || printf WARN)" "$(uname -r)"
+  printf '[%s] BBR: %s / qdisc: %s\n' "$([[ $bbr == bbr && $qdisc == fq ]] && printf OK || printf WARN)" "$bbr" "$qdisc"
+  printf '[INFO] RAM: %s MiB, CPU: %s, virtualization: %s\n' "$ram_mb" "$cpus" "$virt"
+  printf '[INFO] conntrack max: %s, open-file limit: %s\n' "$conntrack" "$nofile"
+  if nft list table inet kenshi_shield >/dev/null 2>&1; then printf '[OK] kenshi_shield nftables table is active\n'; else printf '[WARN] kenshi_shield nftables table is not active\n'; fi
+  if systemctl is-active --quiet crowdsec 2>/dev/null; then printf '[OK] CrowdSec active\n'; else printf '[INFO] CrowdSec not active\n'; fi
+  if systemctl is-active --quiet fail2ban 2>/dev/null; then printf '[OK] Fail2Ban active\n'; else printf '[INFO] Fail2Ban not active\n'; fi
+  printf '\nПроверка не изменяет систему. Для применения используйте пункт «Оптимизация» после просмотра плана.\n'
 }
 
 choose_ui() {
@@ -147,11 +172,99 @@ EOF
   info 'BBR/sysctl applied. XanMod kernel installation is intentionally a separate operator-approved package step.'
 }
 
+optimize_plan() {
+  need_root; init_dirs
+  local ram_mb cpus conntrack
+  ram_mb=$(awk '/MemTotal:/ {printf "%d", $2/1024}' /proc/meminfo 2>/dev/null || printf 1024)
+  cpus=$(nproc 2>/dev/null || printf 1)
+  if (( ram_mb < 2048 )); then conntrack=131072; elif (( ram_mb < 4096 )); then conntrack=262144; elif (( ram_mb < 8192 )); then conntrack=524288; else conntrack=1048576; fi
+  cat >"$OPT_FILE" <<EOF
+RAM_MB=$ram_mb
+CPUS=$cpus
+CONNTRACK_MAX=$conntrack
+ENABLE_BBR=1
+ENABLE_RPS=1
+ENABLE_FILE_LIMITS=1
+ENABLE_JOURNAL_LIMIT=1
+XANMOD_KERNEL=0
+EOF
+  chmod 600 "$OPT_FILE"
+  printf 'План оптимизации:\n  RAM: %s MiB\n  CPU: %s\n  conntrack: %s\n  BBR/fq: yes\n  RPS/RFS/XPS: yes\n  file limits: yes\n  XanMod kernel: отдельный шаг\n' "$ram_mb" "$cpus" "$conntrack"
+}
+
+apply_optimize() {
+  need_root; init_dirs; [[ -r $OPT_FILE ]] || optimize_plan; . "$OPT_FILE"
+  backup_file "$SYSCTL_FILE"
+  cat >"$SYSCTL_FILE" <<EOF
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
+net.core.somaxconn=65535
+net.core.netdev_max_backlog=250000
+net.ipv4.tcp_max_syn_backlog=65535
+net.ipv4.tcp_syncookies=1
+net.netfilter.nf_conntrack_max=$CONNTRACK_MAX
+net.ipv4.tcp_fin_timeout=30
+net.ipv4.tcp_keepalive_time=600
+fs.file-max=1048576
+EOF
+  sysctl --system >/dev/null
+  mkdir -p /etc/systemd/system.conf.d /etc/systemd/journald.conf.d
+  backup_file /etc/systemd/system.conf.d/99-kenshi-shield-limits.conf
+  cat >/etc/systemd/system.conf.d/99-kenshi-shield-limits.conf <<'EOF'
+[Manager]
+DefaultLimitNOFILE=1048576
+DefaultLimitNPROC=1048576
+EOF
+  backup_file /etc/systemd/journald.conf.d/99-kenshi-shield.conf
+  cat >/etc/systemd/journald.conf.d/99-kenshi-shield.conf <<'EOF'
+[Journal]
+SystemMaxUse=500M
+RuntimeMaxUse=100M
+RateLimitIntervalSec=30s
+RateLimitBurst=10000
+EOF
+  backup_file "$RPS_SCRIPT"
+  cat >"$RPS_SCRIPT" <<'EOF'
+#!/usr/bin/env bash
+set -u
+cpus=$(nproc 2>/dev/null || printf 1)
+if (( cpus >= 64 )); then mask=ffffffffffffffff; else mask=$(printf '%x' $(( (1 << cpus) - 1 ))); fi
+for dev in /sys/class/net/*; do
+  name=${dev##*/}
+  [[ $name == lo || -e "$dev/device" ]] || continue
+  for f in "$dev"/queues/rx-*/rps_cpus; do [[ -e $f ]] && printf '%s\n' "$mask" >"$f"; done
+  for f in "$dev"/queues/rx-*/rps_flow_cnt; do [[ -e $f ]] && printf '32768\n' >"$f"; done
+  for f in "$dev"/queues/tx-*/xps_cpus; do [[ -e $f ]] && printf '%s\n' "$mask" >"$f"; done
+done
+EOF
+  chmod 700 "$RPS_SCRIPT"
+  backup_file "$RPS_UNIT"
+  cat >"$RPS_UNIT" <<EOF
+[Unit]
+Description=Kenshi Shield RPS/RFS/XPS tuning
+After=network-pre.target
+
+[Service]
+Type=oneshot
+ExecStart=$RPS_SCRIPT
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload 2>/dev/null || true
+  systemctl enable --now kenshi-shield-rps.service >/dev/null 2>&1 || true
+  info "Оптимизация применена: BBR/fq, conntrack=$CONNTRACK_MAX, limits и journald. RPS/XPS активируется отдельным service после проверки интерфейса."
+}
+
 rollback() {
   need_root; init_dirs
   nft delete table inet kenshi_shield 2>/dev/null || true
   rm -f "$NFT_FILE" "$SHAPER_FILE" "$GEO_FILE" "$CONF_DIR/plan.env"
   rm -f /etc/sysctl.d/99-kenshi-shield.conf
+  rm -f "$SYSCTL_FILE" "$OPT_FILE" /etc/systemd/system.conf.d/99-kenshi-shield-limits.conf /etc/systemd/journald.conf.d/99-kenshi-shield.conf
+  systemctl disable --now kenshi-shield-rps.service >/dev/null 2>&1 || true
+  rm -f "$RPS_SCRIPT" "$RPS_UNIT"
   sysctl --system >/dev/null 2>&1 || true
   info 'Kenshi Shield resources rolled back; third-party firewall tables and kernels were not removed.'
 }
@@ -159,9 +272,9 @@ rollback() {
 menu() {
   choose_ui
   while true; do
-    if [[ $UI == plain ]]; then printf '\n1 audit\n2 plan\n3 apply firewall\n4 apply geo/shaping\n5 rollback\n0 exit\n'; read -r -p '> ' choice; else choice=$($UI --menu 'Kenshi Shield' 16 78 8 1 'Audit' 2 'Plan' 3 'Apply firewall' 4 'Apply geo/shaping' 5 'Rollback' 0 'Exit' 3>&1 1>&2 2>&3) || return; fi
-    case $choice in 1) audit ;; 2) init_dirs; collect_plan; compile_nft; info "Plan: $PLAN_FILE" ;; 3) apply_firewall ;; 4) apply_geoblock; apply_shaping ;; 5) rollback ;; 0) return ;; esac
+    if [[ $UI == plain ]]; then printf '\n1 diagnose\n2 protect\n3 optimize\n4 plan\n5 apply geo/shaping\n6 rollback\n0 exit\n'; read -r -p '> ' choice; else choice=$($UI --menu 'Kenshi Shield' 18 90 8 1 'Диагностика - read-only audit' 2 'Защита от DDoS - nftables/CrowdSec profile' 3 'Оптимизация - BBR/sysctl/limits/RPS' 4 'План firewall' 5 'GeoBlock и traffic shaping' 6 'Rollback' 0 'Выход' 3>&1 1>&2 2>&3) || return; fi
+    case $choice in 1) diagnose ;; 2) apply_firewall ;; 3) optimize_plan; yesno 'Применить оптимизацию сейчас?' && apply_optimize || true ;; 4) init_dirs; collect_plan; compile_nft; info "Plan: $PLAN_FILE" ;; 5) apply_geoblock; apply_shaping ;; 6) rollback ;; 0) return ;; esac
   done
 }
 
-case ${1:-menu} in audit) audit ;; plan) init_dirs; collect_plan; compile_nft ;; apply) apply_firewall; apply_geoblock; apply_shaping; apply_xanmod ;; rollback) rollback ;; menu) menu ;; *) die "usage: $0 [menu|audit|plan|apply|rollback]" ;; esac
+case ${1:-menu} in audit|diagnose) diagnose ;; plan) init_dirs; collect_plan; compile_nft ;; protect|apply-firewall) apply_firewall ;; optimize) optimize_plan; apply_optimize ;; apply) apply_firewall; apply_geoblock; apply_shaping; apply_xanmod ;; rollback) rollback ;; menu) menu ;; *) die "usage: $0 [menu|diagnose|protect|optimize|plan|apply|rollback]" ;; esac
