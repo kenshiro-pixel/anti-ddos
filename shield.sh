@@ -2,34 +2,36 @@
 set -Eeuo pipefail
 
 VERSION="0.1.0"
-STATE_DIR="${KENSHI_STATE_DIR:-/var/lib/kenshi-shield}"
-CONF_DIR="${KENSHI_CONF_DIR:-/etc/kenshi-shield}"
+STATE_DIR="${SHIELD_STATE_DIR:-/var/lib/shield}"
+CONF_DIR="${SHIELD_CONF_DIR:-/etc/shield}"
 BACKUP_DIR="${STATE_DIR}/backups"
 PLAN_FILE="${STATE_DIR}/plan.env"
 LOG_FILE="${STATE_DIR}/operations.log"
 NFT_FILE="${CONF_DIR}/firewall.nft"
 GEO_FILE="${CONF_DIR}/geoblock-countries.txt"
 SHAPER_FILE="${CONF_DIR}/shaping.conf"
-DRY_RUN="${KENSHI_DRY_RUN:-0}"
+DRY_RUN="${DRY_RUN:-0}"
 OPT_FILE="${CONF_DIR}/optimize.env"
-SYSCTL_FILE="/etc/sysctl.d/99-kenshi-shield-optimize.conf"
-RPS_SCRIPT="/usr/local/sbin/kenshi-shield-rps"
-RPS_UNIT="/etc/systemd/system/kenshi-shield-rps.service"
+SYSCTL_FILE="/etc/sysctl.d/99-shield-optimize.conf"
+RPS_SCRIPT="/usr/local/sbin/shield-rps"
+RPS_UNIT="/etc/systemd/system/shield-rps.service"
 NGINX_TEMPLATE="${CONF_DIR}/nginx-performance.conf"
-CDN_MODE="${KENSHI_CDN_MODE:-off}"
-CDN_CIDRS="${KENSHI_CDN_CIDRS:-}"
-DISABLE_IPV6="${KENSHI_DISABLE_IPV6:-0}"
-SAFETY_DELAY="${KENSHI_SAFETY_DELAY:-300}"
-SELF_PATH="${KENSHI_SELF_PATH:-$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/$(basename -- "${BASH_SOURCE[0]}")}"
+NGINX_RATE_LIMIT_TEMPLATE="${CONF_DIR}/nginx-rate-limits.conf"
+CADDY_RATE_LIMIT_TEMPLATE="${CONF_DIR}/Caddyfile.rate-limits"
+CDN_MODE="${CDN_MODE:-off}"
+CDN_CIDRS="${CDN_CIDRS:-}"
+DISABLE_IPV6="${DISABLE_IPV6:-0}"
+SAFETY_DELAY="${SAFETY_DELAY:-300}"
+SELF_PATH="${SHIELD_SELF_PATH:-$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/$(basename -- "${BASH_SOURCE[0]}")}"
 TXN_DIR="${STATE_DIR}/transaction"
 TXN_PREV_NFT="${TXN_DIR}/previous.nft"
 TXN_PREV_NFT_MISSING="${TXN_DIR}/previous.nft.missing"
 TXN_STATE="${TXN_DIR}/state"
-SAFETY_UNIT="kenshi-shield-safety.service"
+SAFETY_UNIT="shield-safety.service"
 
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
-info() { printf '[kenshi] %s\n' "$*"; }
-need_root() { [[ ${EUID} -eq 0 || ${KENSHI_TEST_MODE:-0} == 1 ]] || die 'запустите от root или через sudo'; }
+info() { printf '[shield] %s\n' "$*"; }
+need_root() { [[ ${EUID} -eq 0 || ${SHIELD_TEST_MODE:-0} == 1 ]] || die 'запустите от root или через sudo'; }
 cmd() { command -v "$1" >/dev/null 2>&1; }
 run() { printf '+ %q' "$@" >>"$LOG_FILE"; printf '\n' >>"$LOG_FILE"; "$@"; }
 
@@ -38,7 +40,7 @@ init_dirs() { mkdir -p "$STATE_DIR" "$BACKUP_DIR" "$CONF_DIR"; chmod 700 "$STATE
 capture_previous_nft() {
   mkdir -p "$TXN_DIR"; chmod 700 "$TXN_DIR"
   rm -f "$TXN_PREV_NFT" "$TXN_PREV_NFT_MISSING"
-  if nft list table inet kenshi_shield >"$TXN_PREV_NFT" 2>/dev/null; then
+  if nft list table inet shield >"$TXN_PREV_NFT" 2>/dev/null; then
     chmod 600 "$TXN_PREV_NFT"
     printf 'present\n' >"$TXN_STATE"
   else
@@ -53,7 +55,7 @@ watchdog_recover() {
   [[ -r $TXN_STATE ]] || { info 'No pending transaction'; return 0; }
   local state; state=$(<"$TXN_STATE")
   [[ $state == pending ]] || { info "Transaction state is $state; nothing to recover"; return 0; }
-  nft delete table inet kenshi_shield 2>/dev/null || true
+  nft delete table inet shield 2>/dev/null || true
   if [[ -s $TXN_PREV_NFT ]]; then nft -f "$TXN_PREV_NFT"; fi
   printf 'recovered\n' >"$TXN_STATE"
   info 'Safety watchdog restored the previous Kenshi Shield table.'
@@ -110,7 +112,7 @@ diagnose() {
   printf '[%s] BBR: %s / qdisc: %s\n' "$([[ $bbr == bbr && $qdisc == fq ]] && printf OK || printf WARN)" "$bbr" "$qdisc"
   printf '[INFO] RAM: %s MiB, CPU: %s, virtualization: %s\n' "$ram_mb" "$cpus" "$virt"
   printf '[INFO] conntrack max: %s, open-file limit: %s\n' "$conntrack" "$nofile"
-  if nft list table inet kenshi_shield >/dev/null 2>&1; then printf '[OK] kenshi_shield nftables table is active\n'; else printf '[WARN] kenshi_shield nftables table is not active\n'; fi
+  if nft list table inet shield >/dev/null 2>&1; then printf '[OK] shield nftables table is active\n'; else printf '[WARN] shield nftables table is not active\n'; fi
   if systemctl is-active --quiet crowdsec 2>/dev/null; then printf '[OK] CrowdSec active\n'; else printf '[INFO] CrowdSec not active\n'; fi
   if systemctl is-active --quiet fail2ban 2>/dev/null; then printf '[OK] Fail2Ban active\n'; else printf '[INFO] Fail2Ban not active\n'; fi
   printf '\nПроверка не изменяет систему. Для применения используйте пункт «Оптимизация» после просмотра плана.\n'
@@ -127,8 +129,12 @@ collect_plan() {
   SSH_PORT=${SSH_PORT:-22}
   TCP_PORTS=$(ask 'Public TCP ports (comma-separated)' '443')
   UDP_PORTS=$(ask 'Public UDP ports (comma-separated)' '')
-  CDN_MODE=$(ask 'CDN mode (off, cloudflare, custom)' "${CDN_MODE:-off}")
+  CDN_MODE=$(ask 'CDN provider profile (off, provider, custom)' "${CDN_MODE:-off}")
   CDN_CIDRS=$(ask 'CDN IPv4/IPv6 CIDRs (comma-separated; required for drop)' "${CDN_CIDRS:-}")
+  CDN_ORIGIN_STRICT=0
+  if [[ ${CDN_MODE:-off} != off ]]; then
+    yesno 'Strict CDN-origin: public TCP/UDP ports accept only listed CDN CIDRs?' && CDN_ORIGIN_STRICT=1 || true
+  fi
   NODE_PORT=$(ask 'Remnanode API port (empty = no public allow)' '')
   PANEL_CIDRS=$(ask 'Panel/admin IPv4/IPv6 CIDRs (comma-separated)' '')
   INPUT_POLICY=$(ask 'Input policy (accept for compatibility, drop to close other ports)' 'accept')
@@ -144,6 +150,7 @@ TCP_PORTS=$TCP_PORTS
 UDP_PORTS=$UDP_PORTS
 CDN_MODE=$CDN_MODE
 CDN_CIDRS=$CDN_CIDRS
+CDN_ORIGIN_STRICT=$CDN_ORIGIN_STRICT
 NODE_PORT=$NODE_PORT
 PANEL_CIDRS=$PANEL_CIDRS
 INPUT_POLICY=$INPUT_POLICY
@@ -177,9 +184,13 @@ load_plan() {
   [[ ${SSH_PORT:-} =~ ^[0-9]+$ ]] && (( SSH_PORT >= 1 && SSH_PORT <= 65535 )) || die 'invalid SSH port'
   valid_cidrs "${PANEL_CIDRS:-}" || die 'invalid panel/admin CIDR list'
   valid_cidrs "${CDN_CIDRS:-}" || die 'invalid CDN CIDR list'
-  [[ ${CDN_MODE:-off} =~ ^(off|cloudflare|custom)$ ]] || die 'invalid CDN mode'
+  [[ ${CDN_MODE:-off} =~ ^(off|provider|custom)$ ]] || die 'invalid CDN mode'
   if [[ ${INPUT_POLICY:-accept} == drop && ${CDN_MODE:-off} != off && -z ${CDN_CIDRS:-} ]]; then
     die 'CDN mode with input drop requires explicit CDN_CIDRS'
+  fi
+  [[ ${CDN_ORIGIN_STRICT:-0} =~ ^[01]$ ]] || die 'invalid CDN_ORIGIN_STRICT'
+  if [[ ${CDN_ORIGIN_STRICT:-0} == 1 && ${INPUT_POLICY:-accept} != drop ]]; then
+    die 'strict CDN-origin requires input policy drop'
   fi
   [[ ${INPUT_POLICY:-accept} =~ ^(accept|drop)$ ]] || die 'invalid input policy'
   valid_countries "${GEO_COUNTRIES:-}" || die 'invalid country allow-list (use CC,CC)'
@@ -203,7 +214,11 @@ restore_latest() {
 
 compile_nft() {
   cmd nft || die 'nft is required; install it as a separate approved dependency step'
-  local tcp="" udp=""; [[ -n ${TCP_PORTS:-} ]] && tcp="tcp dport { ${TCP_PORTS//,/ , } }"; [[ -n ${UDP_PORTS:-} ]] && udp="udp dport { ${UDP_PORTS//,/ , } }"
+  local tcp="" udp="" cdn_rules=""; [[ -n ${TCP_PORTS:-} ]] && tcp="tcp dport { ${TCP_PORTS//,/ , } }"; [[ -n ${UDP_PORTS:-} ]] && udp="udp dport { ${UDP_PORTS//,/ , } }"
+  if [[ ${CDN_ORIGIN_STRICT:-0} == 1 ]]; then
+    [[ -n $tcp ]] && cdn_rules+=$'    ip saddr @cdn_v4 '"$tcp"$' counter accept\n    ip6 saddr @cdn_v6 '"$tcp"$' counter accept\n'
+    [[ -n $udp ]] && cdn_rules+=$'    ip saddr @cdn_v4 '"$udp"$' counter accept\n    ip6 saddr @cdn_v6 '"$udp"$' counter accept\n'
+  fi
   local ssh="tcp dport ${SSH_PORT}" smtp_rule="" tcp_meters="" udp_meters="" p idx
   local allow_v4="127.0.0.1" allow_v6="::1" cdn_v4="" cdn_v6="" c
   [[ ${BLOCK_SMTP25:-0} == 1 ]] && smtp_rule='tcp dport 25 counter reject with icmpx type admin-prohibited'
@@ -233,7 +248,7 @@ compile_nft() {
   fi
   cat >"$NFT_FILE" <<EOF
 #!/usr/sbin/nft -f
-table inet kenshi_shield {
+table inet shield {
   set allow_v4 { type ipv4_addr; flags interval; elements = { ${allow_v4} } }
   set allow_v6 { type ipv6_addr; flags interval; elements = { ${allow_v6} } }
   set cdn_v4 { type ipv4_addr; flags interval; ${cdn_v4:+elements = { ${cdn_v4} }} }
@@ -259,6 +274,7 @@ table inet kenshi_shield {
     ip6 saddr @scan_confirmed_v6 counter drop
     $ssh accept
     ${NODE_PORT:+tcp dport $NODE_PORT ip saddr @allow_v4 accept}
+${cdn_rules}
 ${tcp_meters}${udp_meters}
     tcp flags syn add @scan_suspect_v4 { ip saddr timeout 10m } limit rate over 100/second burst 200 packets counter drop
     ip6 nexthdr tcp tcp flags syn add @scan_suspect_v6 { ip6 saddr timeout 10m } limit rate over 100/second burst 200 packets counter drop
@@ -305,8 +321,8 @@ apply_shaping() {
 
 apply_xanmod() {
   need_root; [[ ${ENABLE_XANMOD:-0} == 1 ]] || { info 'XanMod disabled'; return; }
-  backup_file /etc/sysctl.d/99-kenshi-shield.conf
-  cat >/etc/sysctl.d/99-kenshi-shield.conf <<'EOF'
+  backup_file /etc/sysctl.d/99-shield.conf
+  cat >/etc/sysctl.d/99-shield.conf <<'EOF'
 net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=bbr
 net.core.somaxconn=65535
@@ -384,15 +400,41 @@ http {
 }
 EOF
   chmod 600 "$NGINX_TEMPLATE"
+  backup_file "$NGINX_RATE_LIMIT_TEMPLATE"
+  cat >"$NGINX_RATE_LIMIT_TEMPLATE" <<'EOF'
+# Include from the active http{} block after reviewing the node topology.
+limit_req_zone $binary_remote_addr zone=kenshi_panel:10m rate=10r/s;
+limit_req_zone $binary_remote_addr zone=kenshi_subscription:10m rate=30r/s;
+limit_conn_zone $binary_remote_addr zone=kenshi_conn:10m;
+# Example locations:
+# location = /api { limit_req zone=kenshi_panel burst=20 nodelay; }
+# location /sub/ { limit_req zone=kenshi_subscription burst=60 nodelay; }
+# limit_conn kenshi_conn 80;
+EOF
+  chmod 600 "$NGINX_RATE_LIMIT_TEMPLATE"
+  backup_file "$CADDY_RATE_LIMIT_TEMPLATE"
+  cat >"$CADDY_RATE_LIMIT_TEMPLATE" <<'EOF'
+# Caddy reference snippet. Apply only to the matching site and review plugin support.
+# example.com {
+#   rate_limit {
+#     zone panel {
+#       key {remote_host}
+#       events 10
+#       window 1s
+#     }
+#   }
+# }
+EOF
+  chmod 600 "$CADDY_RATE_LIMIT_TEMPLATE"
   mkdir -p /etc/systemd/system.conf.d /etc/systemd/journald.conf.d
-  backup_file /etc/systemd/system.conf.d/99-kenshi-shield-limits.conf
-  cat >/etc/systemd/system.conf.d/99-kenshi-shield-limits.conf <<'EOF'
+  backup_file /etc/systemd/system.conf.d/99-shield-limits.conf
+  cat >/etc/systemd/system.conf.d/99-shield-limits.conf <<'EOF'
 [Manager]
 DefaultLimitNOFILE=1048576
 DefaultLimitNPROC=1048576
 EOF
-  backup_file /etc/systemd/journald.conf.d/99-kenshi-shield.conf
-  cat >/etc/systemd/journald.conf.d/99-kenshi-shield.conf <<'EOF'
+  backup_file /etc/systemd/journald.conf.d/99-shield.conf
+  cat >/etc/systemd/journald.conf.d/99-shield.conf <<'EOF'
 [Journal]
 SystemMaxUse=500M
 RuntimeMaxUse=100M
@@ -429,7 +471,7 @@ RemainAfterExit=yes
 WantedBy=multi-user.target
 EOF
   systemctl daemon-reload 2>/dev/null || true
-  systemctl enable --now kenshi-shield-rps.service >/dev/null 2>&1 || true
+  systemctl enable --now shield-rps.service >/dev/null 2>&1 || true
   info "Оптимизация применена: BBR/fq, conntrack=$CONNTRACK_MAX, limits и journald. RPS/XPS активируется отдельным service после проверки интерфейса."
 }
 
@@ -437,18 +479,20 @@ rollback() {
   need_root; init_dirs
   local restored=0
   if [[ -r $TXN_STATE ]] && [[ $(<"$TXN_STATE") == pending ]]; then
-    nft delete table inet kenshi_shield 2>/dev/null || true
+    nft delete table inet shield 2>/dev/null || true
     if [[ -s $TXN_PREV_NFT ]]; then nft -f "$TXN_PREV_NFT" && restored=1 || true; fi
   fi
-  (( restored == 1 )) || nft delete table inet kenshi_shield 2>/dev/null || true
-  rm -f "$NFT_FILE" "$SHAPER_FILE" "$GEO_FILE" "$CONF_DIR/plan.env" "$NGINX_TEMPLATE"
-  rm -f /etc/sysctl.d/99-kenshi-shield.conf
-  rm -f "$SYSCTL_FILE" "$OPT_FILE" /etc/systemd/system.conf.d/99-kenshi-shield-limits.conf /etc/systemd/journald.conf.d/99-kenshi-shield.conf
+  (( restored == 1 )) || nft delete table inet shield 2>/dev/null || true
+  rm -f "$NFT_FILE" "$SHAPER_FILE" "$GEO_FILE" "$CONF_DIR/plan.env" "$NGINX_TEMPLATE" "$NGINX_RATE_LIMIT_TEMPLATE" "$CADDY_RATE_LIMIT_TEMPLATE"
+  rm -f /etc/sysctl.d/99-shield.conf
+  rm -f "$SYSCTL_FILE" "$OPT_FILE" /etc/systemd/system.conf.d/99-shield-limits.conf /etc/systemd/journald.conf.d/99-shield.conf
   restore_latest "$SYSCTL_FILE" || true
-  restore_latest /etc/systemd/system.conf.d/99-kenshi-shield-limits.conf || true
-  restore_latest /etc/systemd/journald.conf.d/99-kenshi-shield.conf || true
+  restore_latest /etc/systemd/system.conf.d/99-shield-limits.conf || true
+  restore_latest /etc/systemd/journald.conf.d/99-shield.conf || true
   restore_latest "$NGINX_TEMPLATE" || true
-  systemctl disable --now kenshi-shield-rps.service >/dev/null 2>&1 || true
+  restore_latest "$NGINX_RATE_LIMIT_TEMPLATE" || true
+  restore_latest "$CADDY_RATE_LIMIT_TEMPLATE" || true
+  systemctl disable --now shield-rps.service >/dev/null 2>&1 || true
   systemctl stop "$SAFETY_UNIT" 2>/dev/null || true
   rm -rf "$TXN_DIR"
   rm -f "$RPS_SCRIPT" "$RPS_UNIT"
@@ -456,15 +500,32 @@ rollback() {
   info 'Kenshi Shield resources rolled back; third-party firewall tables and kernels were not removed.'
 }
 
+inventory() {
+  need_root; init_dirs
+  printf 'Kenshi Shield inventory\n\n'
+  printf 'OS: '; . /etc/os-release 2>/dev/null; printf '%s %s\n' "${ID:-unknown}" "${VERSION_ID:-unknown}"
+  printf 'Kernel: '; uname -r; printf 'Arch: '; uname -m
+  printf 'Virtualization: '; systemd-detect-virt 2>/dev/null || printf 'unknown\n'
+  printf '\nInterfaces:\n'; ip -brief address 2>/dev/null || true
+  printf '\nListeners:\n'; ss -H -lntup 2>/dev/null || true
+  printf '\nDocker:\n'
+  if cmd docker; then docker ps --format 'table {{.Names}}\t{{.Image}}\t{{.Ports}}' 2>/dev/null || true; docker network ls 2>/dev/null || true; else printf 'docker: absent\n'; fi
+  printf '\nRemnanode candidates:\n'
+  systemctl list-unit-files --type=service 2>/dev/null | grep -Ei 'remna|xray|3x-ui' || true
+  ps -eo pid,comm,args 2>/dev/null | grep -Ei '[r]emna|[x]ray' || true
+  printf '\nReverse proxy:\n'
+  for svc in nginx caddy; do systemctl is-active "$svc" 2>/dev/null && printf '%s active\n' "$svc" || true; done
+}
+
 status() {
   need_root; init_dirs
   printf 'Kenshi Shield %s status\n' "$VERSION"
-  if nft list table inet kenshi_shield >/dev/null 2>&1; then printf 'firewall: active\n'; else printf 'firewall: inactive\n'; fi
+  if nft list table inet shield >/dev/null 2>&1; then printf 'firewall: active\n'; else printf 'firewall: inactive\n'; fi
   [[ -r $OPT_FILE ]] && printf 'optimization: planned (%s)\n' "$OPT_FILE" || printf 'optimization: not planned\n'
   [[ ${INPUT_POLICY:-} == drop ]] && printf 'input policy: drop\n' || printf 'input policy: accept/unknown\n'
   [[ -r $GEO_FILE ]] && printf 'geoblock policy: staged\n' || printf 'geoblock policy: not configured\n'
   [[ -r $SHAPER_FILE ]] && printf 'shaping: %s\n' "$(tr -d '\n' <"$SHAPER_FILE")" || printf 'shaping: not configured\n'
-  systemctl is-enabled --quiet kenshi-shield-rps.service 2>/dev/null && printf 'rps/rfs/xps: enabled\n' || printf 'rps/rfs/xps: disabled\n'
+  systemctl is-enabled --quiet shield-rps.service 2>/dev/null && printf 'rps/rfs/xps: enabled\n' || printf 'rps/rfs/xps: disabled\n'
 }
 
 menu() {
@@ -475,4 +536,4 @@ menu() {
   done
 }
 
-case ${1:-menu} in audit|diagnose) diagnose ;; status) status ;; plan) init_dirs; if [[ ! -r $PLAN_FILE ]]; then choose_ui; collect_plan; fi; load_plan; compile_nft ;; protect|apply-firewall) apply_firewall ;; optimize) optimize_plan; apply_optimize ;; apply) apply_firewall; apply_geoblock; apply_shaping; apply_xanmod ;; commit) commit_transaction ;; watchdog-recover) watchdog_recover ;; rollback) rollback ;; menu) menu ;; *) die "usage: $0 [menu|status|diagnose|protect|optimize|plan|apply|commit|rollback]" ;; esac
+case ${1:-menu} in audit|diagnose) diagnose ;; inventory) inventory ;; status) status ;; plan) init_dirs; if [[ ! -r $PLAN_FILE ]]; then choose_ui; collect_plan; fi; load_plan; compile_nft ;; protect|apply-firewall) apply_firewall ;; optimize) optimize_plan; apply_optimize ;; apply) apply_firewall; apply_geoblock; apply_shaping; apply_xanmod ;; commit) commit_transaction ;; watchdog-recover) watchdog_recover ;; rollback) rollback ;; menu) menu ;; *) die "usage: $0 [menu|status|inventory|diagnose|protect|optimize|plan|apply|commit|rollback]" ;; esac

@@ -9,7 +9,7 @@ GUI/CLI-инсталлятор для hardening Remnawave/Remnanode VPS с Nginx
 - локальное меню через `whiptail`, `dialog` или безопасный plain fallback;
 - read-only аудит ОС, ядра, виртуализации, listeners, firewall и сервисов;
 - план с явными портами SSH, Xray и Remnanode API;
-- собственная таблица `inet kenshi_shield` без `flush ruleset`;
+- собственная таблица `inet shield` без `flush ruleset`;
 - явная input policy: совместимый `accept` или подтверждаемый режим `drop` для закрытия лишних портов;
 - выбор TCP/UDP портов и явный CDN allowlist по IPv4/IPv6 CIDR;
 - IPv4/IPv6 allowlist панели и администратора;
@@ -30,31 +30,31 @@ GeoBlock не включается только по названию стран
 
 Локальный firewall не заменяет provider DDoS scrubbing и не спасает от насыщения uplink. Панель, API, Xray transport и VPN handshake нужно проверять отдельно.
 
-Для CDN указывайте реальные диапазоны провайдера в `CDN_CIDRS`. Режим `drop` специально останавливается без этого списка, чтобы не отрезать Cloudflare или другой CDN. Список не подставляется автоматически из mutable URL.
+Для CDN указывайте реальные диапазоны провайдера в `CDN_CIDRS`. Режим `drop` специально останавливается без этого списка, чтобы не отрезать выбранный CDN-провайдер. Список не подставляется автоматически из mutable URL.
 
 ## Запуск
 
 ```bash
-sudo bash kenshi-shield.sh menu
-sudo bash kenshi-shield.sh audit
-sudo bash kenshi-shield.sh plan
-sudo bash kenshi-shield.sh apply
-sudo bash kenshi-shield.sh rollback
+sudo bash shield.sh menu
+sudo bash shield.sh audit
+sudo bash shield.sh plan
+sudo bash shield.sh apply
+sudo bash shield.sh rollback
 # либо
 sudo bash rollback.sh
 ```
 
-Перед `apply` проверьте сгенерированный `/etc/kenshi-shield/firewall.nft`. SSH-порт и адреса панели должны быть указаны явно. Не применяйте правила на production без консольного доступа или проверенного watchdog/recovery пути.
+Перед `apply` проверьте сгенерированный `/etc/shield/firewall.nft`. SSH-порт и адреса панели должны быть указаны явно. Не применяйте правила на production без консольного доступа или проверенного watchdog/recovery пути.
 
 После применения с включённым safety timer сначала проверьте новую SSH-сессию, node API, reverse proxy и нужный VPN transport. Только после этих проверок подтвердите транзакцию:
 
 ```bash
-sudo bash kenshi-shield.sh commit
+sudo bash shield.sh commit
 ```
 
-Если GUI или SSH оборвутся, независимый systemd watchdog по таймауту восстановит предыдущую таблицу `inet kenshi_shield`. Ручной откат выполняется через `sudo bash rollback.sh`; он удаляет только ресурсы Kenshi Shield и восстанавливает сохранённые файлы, включая состояние «файла не было».
+Если GUI или SSH оборвутся, независимый systemd watchdog по таймауту восстановит предыдущую таблицу `inet shield`. Ручной откат выполняется через `sudo bash rollback.sh`; он удаляет только ресурсы Kenshi Shield и восстанавливает сохранённые файлы, включая состояние «файла не было».
 
-Для проверки без применения используйте `KENSHI_DRY_RUN=1`. В режиме `drop` нужно заранее перечислить SSH, публичные Xray-порты, UDP-порты и управляющие CIDR; текущая SSH-сессия сама по себе не считается достаточной проверкой.
+Для проверки без применения используйте `DRY_RUN=1`. В режиме `drop` нужно заранее перечислить SSH, публичные Xray-порты, UDP-порты и управляющие CIDR; текущая SSH-сессия сама по себе не считается достаточной проверкой.
 
 ## Модули GUI
 
@@ -64,7 +64,7 @@ sudo bash kenshi-shield.sh commit
 | `Оптимизация` | tier-aware sysctl, BBR/fq, conntrack, socket backlog, systemd limits и journald limits |
 | `Диагностика` | read-only отчёт по kernel/BBR/sysctl/conntrack/firewall/CrowdSec/Fail2Ban/listeners |
 
-465/587 остаются разрешёнными: базовая SMTP-политика затрагивает только outbound TCP/25. Оптимизация включает BBR/fq, TFO, MTU probing, keepalive, conntrack и file limits. Отключение IPv6 доступно только явным флагом `KENSHI_DISABLE_IPV6=1` после проверки CDN, Docker, ACME и Remnawave topology; по умолчанию IPv6 сохраняется. XanMod kernel, SYNPROXY, GeoIP enforcement, CrowdSec/Fail2Ban installation и per-user eBPF shaping остаются отдельными advanced-профилями: GUI показывает их явно и не применяет без отдельного подтверждения.
+465/587 остаются разрешёнными: базовая SMTP-политика затрагивает только outbound TCP/25. Оптимизация включает BBR/fq, TFO, MTU probing, keepalive, conntrack и file limits. Отключение IPv6 доступно только явным флагом `DISABLE_IPV6=1` после проверки CDN, Docker, ACME и Remnawave topology; по умолчанию IPv6 сохраняется. XanMod kernel, SYNPROXY, GeoIP enforcement, CrowdSec/Fail2Ban installation и per-user eBPF shaping остаются отдельными advanced-профилями: GUI показывает их явно и не применяет без отдельного подтверждения.
 
 ## Следующие модули
 
