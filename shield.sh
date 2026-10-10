@@ -246,6 +246,10 @@ compile_nft() {
       idx=$((idx + 1))
     done
   fi
+  if [[ ${CDN_ORIGIN_STRICT:-0} == 1 ]]; then
+    tcp_meters=""
+    udp_meters=""
+  fi
   cat >"$NFT_FILE" <<EOF
 #!/usr/sbin/nft -f
 table inet shield {
